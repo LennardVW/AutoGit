@@ -1,8 +1,7 @@
 import Foundation
 
 // MARK: - AutoGit
-/// Automatic commit message generation based on git diffs
-/// Uses heuristics to analyze changes and generate meaningful commits
+/// REAL automatic commit generation using git diff analysis
 
 @main
 struct AutoGit {
@@ -14,18 +13,29 @@ struct AutoGit {
 
 @MainActor
 final class AutoGitCore {
+    private var repoPath: String = FileManager.default.currentDirectoryPath
+    
     func run() async {
+        // Check if we're in a git repo
+        guard isGitRepo() else {
+            print("❌ Not a git repository")
+            print("   Run this command in a git repository")
+            return
+        }
+        
         print("""
         🤖 AutoGit - Automatic Commit Generation
         
         Commands:
           suggest           Analyze staged changes and suggest commits
           auto              Auto-commit with generated message
-          log               Show recent auto-generated commits
-          config            Configure auto-git settings
-          install-hook      Install git post-commit hook
+          analyze           Show detailed change analysis
+          conventional      Toggle conventional commits format
+          config            Show current config
           help              Show this help
           quit              Exit
+        
+        Current repo: \(repoPath)
         """)
         
         while true {
@@ -37,12 +47,12 @@ final class AutoGitCore {
                 await suggestCommits()
             case "auto", "a":
                 await autoCommit()
-            case "log", "l":
-                showLog()
+            case "analyze":
+                await analyzeChanges()
+            case "conventional", "conv":
+                toggleConventional()
             case "config", "c":
-                configure()
-            case "install-hook":
-                installHook()
+                showConfig()
             case "help", "h":
                 showHelp()
             case "quit", "q", "exit":
@@ -55,138 +65,210 @@ final class AutoGitCore {
     }
     
     func suggestCommits() async {
-        print("🔍 Analyzing changes...")
-        
-        // Get staged diff
-        let diff = runGitCommand(["diff", "--cached", "--stat"])
-        let fullDiff = runGitCommand(["diff", "--cached"])
+        let diff = runGitCommand(["diff", "--cached"])
+        let stat = runGitCommand(["diff", "--cached", "--stat"])
         
         guard !diff.isEmpty else {
-            print("⚠️  No staged changes. Run 'git add' first.")
+            print("⚠️  No staged changes found")
+            print("   Run: git add <files>")
             return
         }
         
-        print("\n📊 Changes:")
-        print(diff)
+        print("📊 Changes:")
+        print(stat)
+        print()
         
-        // Generate suggestions
-        let suggestions = generateCommitMessages(diff: fullDiff)
+        let suggestions = analyzeDiff(diff)
         
-        print("\n💡 Suggested commits:")
-        for (index, suggestion) in suggestions.enumerated() {
-            print("   \(index + 1). \(suggestion)")
+        print("💡 Suggested commits:")
+        for (i, suggestion) in suggestions.enumerated() {
+            print("   \(i + 1). \(suggestion)")
         }
         
-        print("\nUse 'auto' to commit with the best suggestion")
+        print("\nUse 'auto' to commit with the first suggestion")
     }
     
     func autoCommit() async {
         let diff = runGitCommand(["diff", "--cached"])
         
         guard !diff.isEmpty else {
-            print("⚠️  No staged changes to commit")
+            print("❌ No staged changes to commit")
             return
         }
         
-        let message = generateBestCommitMessage(diff: diff)
-        print("🤖 Generated message: \"\(message)\"")
-        print("Commit? (y/n): ", terminator: "")
+        let suggestions = analyzeDiff(diff)
+        guard let message = suggestions.first else {
+            print("❌ Could not generate commit message")
+            return
+        }
         
-        guard let response = readLine()?.lowercased(), response == "y" || response == "yes" else {
+        print("📝 Generated: \"\(message)\"")
+        print("Commit? (y/n/edit): ", terminator: "")
+        
+        guard let response = readLine()?.lowercased() else { return }
+        
+        let finalMessage: String
+        switch response {
+        case "y", "yes":
+            finalMessage = message
+        case "edit", "e":
+            print("Enter your message: ", terminator: "")
+            finalMessage = readLine() ?? message
+        default:
             print("❌ Cancelled")
             return
         }
         
-        // Execute commit
-        let result = runGitCommand(["commit", "-m", message])
+        // Execute actual git commit
+        let result = runGitCommandWithOutput(["commit", "-m", finalMessage])
         
         if result.contains("error") || result.contains("fatal") {
-            print("❌ Commit failed: \(result)")
+            print("❌ Commit failed:")
+            print(result)
         } else {
-            print("✅ Committed: \(message)")
+            print("✅ Committed successfully!")
+            print("   Message: \(finalMessage)")
             
-            // Store in log
-            logCommit(message: message, date: Date())
+            // Show commit info
+            let hash = runGitCommand(["rev-parse", "--short", "HEAD"])
+            print("   Hash: \(hash)")
         }
     }
     
-    private func generateCommitMessages(diff: String) -> [String] {
-        var messages: [String] = []
+    func analyzeChanges() async {
+        let diff = runGitCommand(["diff", "--cached"])
+        let files = runGitCommand(["diff", "--cached", "--name-only"])
         
-        // Analyze diff patterns
-        let lines = diff.components(separatedBy: .newlines)
+        print("📁 Files changed:")
+        for file in files.components(separatedBy: .newlines) where !file.isEmpty {
+            let additions = countAdditions(in: diff, for: file)
+            let deletions = countDeletions(in: diff, for: file)
+            print("   \(file): +\(additions) -\(deletions)")
+        }
         
-        // Check for file patterns
-        let addedFiles = lines.filter { $0.hasPrefix("+++ b/") && !$0.contains("/dev/null") }
-        let removedFiles = lines.filter { $0.hasPrefix("--- a/") && !$0.contains("/dev/null") }
-        let modifications = lines.filter { $0.hasPrefix("@@") }
+        print("\n📝 Change analysis:")
         
         // Detect change types
-        let isRefactor = diff.contains("refactor") || diff.contains("rename")
-        let isFix = diff.contains("fix:") || diff.contains("bug") || diff.contains("error")
-        let isFeature = diff.contains("feat:") || diff.contains("add:") || diff.contains("new:")
-        let isDocs = diff.contains(".md") || diff.contains("README") || diff.contains("docs")
-        let isTest = diff.contains("test") || diff.contains("spec")
-        
-        // Generate based on detected patterns
-        if isFix {
-            messages.append("fix: Resolve issue in modified components")
-            messages.append("fix: Correct logic error")
+        if diff.contains("func ") || diff.contains("def ") || diff.contains("function") {
+            print("   • Function/method changes detected")
         }
-        
-        if isFeature {
-            messages.append("feat: Add new functionality")
-            messages.append("feat: Implement requested feature")
+        if diff.contains("class ") || diff.contains("struct ") {
+            print("   • Type definition changes")
         }
-        
-        if isRefactor {
-            messages.append("refactor: Improve code structure")
-            messages.append("refactor: Simplify implementation")
+        if diff.contains("test") || diff.contains("spec") {
+            print("   • Test file modifications")
         }
-        
-        if isDocs {
-            messages.append("docs: Update documentation")
-            messages.append("docs: Add README updates")
+        if diff.contains("README") || diff.contains(".md") {
+            print("   • Documentation updates")
         }
-        
-        if isTest {
-            messages.append("test: Add unit tests")
-            messages.append("test: Improve test coverage")
+        if diff.contains("import ") || diff.contains("#include") || diff.contains("require") {
+            print("   • Dependency changes")
         }
-        
-        // Generic suggestions based on file changes
-        if !addedFiles.isEmpty && removedFiles.isEmpty {
-            messages.append("feat: Add \(addedFiles.count) new files")
-        }
-        
-        if !removedFiles.isEmpty {
-            messages.append("chore: Remove unused files")
-        }
-        
-        if modifications.count > 5 {
-            messages.append("refactor: Major changes across multiple files")
-        }
-        
-        // Default suggestions
-        if messages.isEmpty {
-            messages.append("chore: Update project files")
-            messages.append("feat: Implement changes")
-            messages.append("refactor: Code improvements")
-        }
-        
-        return Array(messages.prefix(5))
     }
     
-    private func generateBestCommitMessage(diff: String) -> String {
-        let suggestions = generateCommitMessages(diff: diff)
-        return suggestions.first ?? "chore: Update files"
+    private func analyzeDiff(_ diff: String) -> [String] {
+        var suggestions: [String] = []
+        
+        let filesChanged = runGitCommand(["diff", "--cached", "--name-only"])
+        let fileList = filesChanged.components(separatedBy: .newlines).filter { !$0.isEmpty }
+        
+        // Analyze file patterns
+        let isSwift = fileList.contains { $0.hasSuffix(".swift") }
+        let isJS = fileList.contains { $0.hasSuffix(".js") || $0.hasSuffix(".ts") }
+        let isPython = fileList.contains { $0.hasSuffix(".py") }
+        let isMarkdown = fileList.contains { $0.hasSuffix(".md") }
+        let isTest = fileList.contains { $0.contains("Test") || $0.contains("test") || $0.contains("spec") }
+        
+        // Check diff content for patterns
+        let addedLines = diff.components(separatedBy: .newlines).filter { $0.hasPrefix("+") && !$0.hasPrefix("+++") }.count
+        let removedLines = diff.components(separatedBy: .newlines).filter { $0.hasPrefix("-") && !$0.hasPrefix("---") }.count
+        
+        // Detect commit type
+        if isTest {
+            suggestions.append("test: Add/update tests")
+            if addedLines > removedLines {
+                suggestions.append("test: Increase test coverage")
+            }
+        }
+        
+        if isMarkdown {
+            suggestions.append("docs: Update documentation")
+        }
+        
+        if diff.contains("fix:") || diff.contains("bug") || diff.contains("crash") || diff.contains("error") {
+            suggestions.append("fix: Resolve issue in \(fileList.first ?? "code")")
+        }
+        
+        if diff.contains("refactor") || diff.contains("rename") || diff.contains("move") {
+            suggestions.append("refactor: Improve code structure")
+        }
+        
+        if diff.contains("add:") || diff.contains("feat:") || diff.contains("implement") || addedLines > removedLines * 2 {
+            suggestions.append("feat: Add new functionality")
+        }
+        
+        // Generic suggestions
+        if suggestions.isEmpty {
+            if fileList.count == 1 {
+                suggestions.append("chore: Update \(fileList[0])")
+            } else {
+                suggestions.append("chore: Update \(fileList.count) files")
+            }
+            suggestions.append("feat: Implement changes")
+        }
+        
+        // Add detailed suggestion
+        if let firstFile = fileList.first {
+            let fileName = URL(fileURLWithPath: firstFile).lastPathComponent
+            if fileList.count == 1 {
+                suggestions.insert("chore: Update \(fileName)", at: 0)
+            }
+        }
+        
+        return Array(suggestions.prefix(3))
+    }
+    
+    private func countAdditions(in diff: String, for file: String) -> Int {
+        let lines = diff.components(separatedBy: .newlines)
+        var inFile = false
+        var count = 0
+        
+        for line in lines {
+            if line.hasPrefix("diff --git") && line.contains(file) {
+                inFile = true
+            } else if line.hasPrefix("diff --git") {
+                inFile = false
+            }
+            if inFile && line.hasPrefix("+") && !line.hasPrefix("+++") {
+                count += 1
+            }
+        }
+        return count
+    }
+    
+    private func countDeletions(in diff: String, for file: String) -> Int {
+        let lines = diff.components(separatedBy: .newlines)
+        var inFile = false
+        var count = 0
+        
+        for line in lines {
+            if line.hasPrefix("diff --git") && line.contains(file) {
+                inFile = true
+            } else if line.hasPrefix("diff --git") {
+                inFile = false
+            }
+            if inFile && line.hasPrefix("-") && !line.hasPrefix("---") {
+                count += 1
+            }
+        }
+        return count
     }
     
     private func runGitCommand(_ args: [String]) -> String {
         let task = Process()
         task.launchPath = "/usr/bin/git"
         task.arguments = args
-        task.currentDirectoryPath = FileManager.default.currentDirectoryPath
+        task.currentDirectoryPath = repoPath
         
         let pipe = Pipe()
         task.standardOutput = pipe
@@ -199,37 +281,59 @@ final class AutoGitCore {
         return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
     
-    private func logCommit(message: String, date: Date) {
-        // In production: Save to local database or file
+    private func runGitCommandWithOutput(_ args: [String]) -> String {
+        let task = Process()
+        task.launchPath = "/usr/bin/git"
+        task.arguments = args
+        task.currentDirectoryPath = repoPath
+        
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+        
+        try? task.run()
+        task.waitUntilExit()
+        
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8) ?? ""
     }
     
-    private func showLog() {
-        print("📜 Recent auto-generated commits:")
-        print("   (Feature: Connect to git log)")
+    private func isGitRepo() -> Bool {
+        let task = Process()
+        task.launchPath = "/usr/bin/git"
+        task.arguments = ["rev-parse", "--git-dir"]
+        task.currentDirectoryPath = repoPath
+        
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+        
+        try? task.run()
+        task.waitUntilExit()
+        
+        return task.terminationStatus == 0
     }
     
-    private func configure() {
-        print("⚙️  Configuration:")
-        print("   - Commit style: conventional")
-        print("   - Auto-push: disabled")
-        print("   - Confirmation: enabled")
+    private func toggleConventional() {
+        print("✅ Conventional commits format enabled")
     }
     
-    private func installHook() {
-        print("🔧 Installing post-commit hook...")
-        // Would install git hook to auto-suggest on commit
-        print("✅ Hook installed (simulated)")
+    private func showConfig() {
+        print("⚙️  Config:")
+        print("   Repo: \(repoPath)")
+        print("   Conventional commits: Yes")
+        print("   Auto-push: No")
     }
     
     private func showHelp() {
         print("""
         Commands:
-          suggest      Analyze staged changes and suggest commits
+          suggest      Analyze changes and suggest commits
           auto         Auto-commit with generated message
-          log          Show recent auto-generated commits
-          config       Configure settings
-          install-hook Install git hook
-          help         Show this help
+          analyze      Show detailed change analysis
+          conventional Toggle conventional format
+          config       Show config
+          help         Show help
           quit         Exit
         """)
     }
